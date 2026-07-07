@@ -428,3 +428,142 @@ def test_ewm_mean_by_parsed_int_expr_visitor() -> None:
     name, half_life = fn.function_data
     assert name == _expr_nodes.EwmFunction.MeanBy
     assert half_life == (0, 0, 0, 2, True, False)
+
+
+def _collect_rolling_by_functions(query: pl.LazyFrame) -> list[tuple[Any, list[Any]]]:
+    """Traverse a query's IR; collect (Function, inputs) for rolling ``*_by`` exprs."""
+    results: list[tuple[Any, list[Any]]] = []
+
+    def callback(node_traverser: Any, query_start: int | None) -> None:
+        for expr_ir in node_traverser.get_exprs():
+            expr_node = node_traverser.view_expression(expr_ir.node)
+            if isinstance(expr_node, _expr_nodes.Function):
+                function_data = expr_node.function_data
+                if function_data and isinstance(
+                    function_data[0], _expr_nodes.RollingFunctionBy
+                ):
+                    inputs = [
+                        node_traverser.view_expression(i) for i in expr_node.input
+                    ]
+                    results.append((expr_node, inputs))
+
+    query.collect(  # pyrefly: ignore[no-matching-overload]
+        post_opt_callback=callback  # type: ignore[call-overload]
+    )
+    return results
+
+
+def test_rolling_mean_by_expr_visitor() -> None:
+    """Test that rolling_mean_by exposes its Duration window, closed, and `by` input."""
+    q = pl.LazyFrame(
+        {
+            "x": [1.0, 2.0, 3.0],
+            "t": [datetime(2020, 1, 1), datetime(2020, 1, 2), datetime(2020, 1, 3)],
+        }
+    ).with_columns(
+        pl.col("x").rolling_mean_by("t", window_size="2h").alias("rmean_by"),
+    )
+    rolling_exprs = _collect_rolling_by_functions(q)
+    assert len(rolling_exprs) == 1
+    fn, inputs = rolling_exprs[0]
+    # Two inputs: the values column first, then the `by` column second.
+    assert len(inputs) == 2
+    assert isinstance(inputs[0], _expr_nodes.Column)
+    assert inputs[0].name == "x"
+    by_node = inputs[1]
+    assert isinstance(by_node, _expr_nodes.Column)
+    assert by_node.name == "t"
+    name, window_size, min_periods, closed, fn_params = fn.function_data
+    assert name == _expr_nodes.RollingFunctionBy.MeanBy
+    # Wrap<Duration> 6-tuple: (months, weeks, days, nanoseconds, parsed_int, negative)
+    assert window_size == (0, 0, 0, 2 * 3600 * 1_000_000_000, False, False)
+    assert min_periods == 1
+    assert closed == "right"
+    assert fn_params == ()
+
+
+@pytest.mark.parametrize(
+    ("expr", "expected"),
+    [
+        (pl.col("x").rolling_min_by("t", "2h"), "MinBy"),
+        (pl.col("x").rolling_max_by("t", "2h"), "MaxBy"),
+        (pl.col("x").rolling_mean_by("t", "2h"), "MeanBy"),
+        (pl.col("x").rolling_sum_by("t", "2h"), "SumBy"),
+        (pl.col("x").rolling_std_by("t", "2h"), "StdBy"),
+        (pl.col("x").rolling_var_by("t", "2h"), "VarBy"),
+        (pl.col("x").rolling_median_by("t", "2h"), "QuantileBy"),
+        (pl.col("x").rolling_quantile_by("t", "2h", quantile=0.5), "QuantileBy"),
+        (pl.col("x").rolling_rank_by("t", "2h"), "RankBy"),
+    ],
+)
+def test_rolling_by_all_variants_exposed(expr: pl.Expr, expected: str) -> None:
+    """All rolling ``*_by`` methods round-trip (median_by shares QuantileBy)."""
+    q = pl.LazyFrame(
+        {
+            "x": [1.0, 2.0, 3.0],
+            "t": [datetime(2020, 1, 1), datetime(2020, 1, 2), datetime(2020, 1, 3)],
+        }
+    ).with_columns(expr.alias("out"))
+    rolling_exprs = _collect_rolling_by_functions(q)
+    assert len(rolling_exprs) == 1
+    fn, inputs = rolling_exprs[0]
+    assert len(inputs) == 2
+    assert fn.function_data[0] == getattr(_expr_nodes.RollingFunctionBy, expected)
+
+
+def test_rolling_var_by_ddof_expr_visitor() -> None:
+    """rolling_var_by serializes ddof into fn_params."""
+    q = pl.LazyFrame(
+        {
+            "x": [1.0, 2.0, 3.0],
+            "t": [datetime(2020, 1, 1), datetime(2020, 1, 2), datetime(2020, 1, 3)],
+        }
+    ).with_columns(
+        pl.col("x").rolling_var_by("t", "2h", ddof=2).alias("rvar_by"),
+    )
+    rolling_exprs = _collect_rolling_by_functions(q)
+    assert len(rolling_exprs) == 1
+    fn, _inputs = rolling_exprs[0]
+    name, _window, _min, _closed, fn_params = fn.function_data
+    assert name == _expr_nodes.RollingFunctionBy.VarBy
+    assert fn_params == (2,)
+
+
+def test_rolling_quantile_by_expr_visitor() -> None:
+    """rolling_quantile_by serializes probability and interpolation method."""
+    q = pl.LazyFrame(
+        {
+            "x": [1.0, 2.0, 3.0],
+            "t": [datetime(2020, 1, 1), datetime(2020, 1, 2), datetime(2020, 1, 3)],
+        }
+    ).with_columns(
+        pl.col("x").rolling_quantile_by("t", "2h", quantile=0.25).alias("rq_by"),
+    )
+    rolling_exprs = _collect_rolling_by_functions(q)
+    assert len(rolling_exprs) == 1
+    fn, _inputs = rolling_exprs[0]
+    name, _window, _min, _closed, fn_params = fn.function_data
+    assert name == _expr_nodes.RollingFunctionBy.QuantileBy
+    prob, method = fn_params
+    assert prob == pytest.approx(0.25)
+    assert method == "nearest"
+
+
+def test_rolling_rank_by_expr_visitor() -> None:
+    """rolling_rank_by serializes method and seed."""
+    q = pl.LazyFrame(
+        {
+            "x": [1.0, 2.0, 3.0],
+            "t": [datetime(2020, 1, 1), datetime(2020, 1, 2), datetime(2020, 1, 3)],
+        }
+    ).with_columns(
+        pl.col("x").rolling_rank_by("t", "2h").alias("rrank_by"),
+    )
+    rolling_exprs = _collect_rolling_by_functions(q)
+    assert len(rolling_exprs) == 1
+    fn, _inputs = rolling_exprs[0]
+    name, _window, _min, _closed, fn_params = fn.function_data
+    assert name == _expr_nodes.RollingFunctionBy.RankBy
+    method, seed = fn_params
+    assert method == "average"
+    assert seed is None
